@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bench — daily planner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=IBM+Plex+Mono:wght@400;500&display=swap');
+html, body { margin: 0; padding: 0; background: #121014; }
+.bench * { box-sizing: border-box; }
+.bench button { cursor: pointer; font-family: inherit; }
+.bench button:focus-visible, .bench input:focus-visible, .bench textarea:focus-visible {
+  outline: 2px solid #B08D57; outline-offset: 2px;
+}
+.bench input, .bench textarea { font-family: inherit; }
+.bench input[type="time"] { color-scheme: dark; }
+@keyframes benchPulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { .bench * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+/* storage: Claude persistent storage if available, else the browser's own storage, else memory */
+if (!window.storage) {
+  let backend = null;
+  try {
+    localStorage.setItem("__bench_test", "1");
+    localStorage.removeItem("__bench_test");
+    backend = localStorage;
+  } catch (e) { backend = null; }
+  if (backend) {
+    window.storage = {
+      async get(k) { const v = backend.getItem("bench:" + k); if (v == null) throw new Error("not found"); return { key: k, value: v }; },
+      async set(k, v) { backend.setItem("bench:" + k, v); return { key: k, value: v }; },
+      async delete(k) { backend.removeItem("bench:" + k); return { key: k, deleted: true }; },
+      async list(p = "") {
+        const keys = [];
+        for (let i = 0; i < backend.length; i++) {
+          const k = backend.key(i);
+          if (k && k.startsWith("bench:" + p)) keys.push(k.slice(6));
+        }
+        return { keys };
+      },
+    };
+  } else {
+    const mem = {};
+    window.storage = {
+      async get(k) { if (!(k in mem)) throw new Error("not found"); return { key: k, value: mem[k] }; },
+      async set(k, v) { mem[k] = v; return { key: k, value: v }; },
+      async delete(k) { delete mem[k]; return { key: k, deleted: true }; },
+      async list(p = "") { return { keys: Object.keys(mem).filter((k) => k.startsWith(p)) }; },
+    };
+  }
+}
+
+const C = {
+  bg: "#121014", panel: "#1B181F", panel2: "#232028", line: "#2E2933",
+  bone: "#E8E3DA", muted: "#8F8798", faint: "#5E5866",
+  garnet: "#A62639", garnetDim: "#6E1D2A", gold: "#B08D57", patina: "#4E7D63",
+};
+const display = { fontFamily: "'Cormorant Garamond', Georgia, serif" };
+const mono = { fontFamily: "'IBM Plex Mono', ui-monospace, monospace" };
+
+const pad = (n) => String(n).padStart(2, "0");
+const keyFor = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const toMin = (hhmm) => { if (!hhmm) return null; const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
+const fmt12 = (m) => {
+  const h = Math.floor(m / 60), mm = m % 60, ap = h >= 12 ? "pm" : "am";
+  const h12 = ((h + 11) % 12) + 1;
+  return `${h12}:${pad(mm)}${ap}`;
+};
+const fmtDur = (min) => {
+  const h = Math.floor(min / 60), m = min % 60;
+  return h ? (m ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
+};
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+const POMO_WORK = 25 * 60, POMO_BREAK = 5 * 60, POMO_LONG = 15 * 60;
+const fmtClock = (sec) => {
+  const s = Math.abs(sec);
+  return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
+};
+function beep(times = 2) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    for (let i = 0; i < times; i++) {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.type = "sine"; o.frequency.value = 660; g.gain.value = 0.07;
+      o.start(ctx.currentTime + i * 0.35);
+      o.stop(ctx.currentTime + i * 0.35 + 0.18);
+    }
+  } catch (e) { /* audio unavailable — stay silent */ }
+}
+
+async function loadDay(key) {
+  try { const r = await window.storage.get(`day:${key}`); return r ? JSON.parse(r.value) : null; }
+  catch { return null; }
+}
+async function saveDay(key, data) {
+  try { await window.storage.set(`day:${key}`, JSON.stringify(data)); } catch (e) { console.error("save failed", e); }
+}
+const blankDay = (key) => ({
+  date: key, committed: false, shutdownDone: false, focusId: null, reflection: "", tasks: [],
+});
+
+function Eyebrow({ children }) {
+  return (
+    <div style={{ ...mono, fontSize: 11, letterSpacing: "0.22em", textTransform: "uppercase", color: C.gold }}>
+      {children}
+    </div>
+  );
+}
+
+function Btn({ children, kind = "ghost", onClick, disabled, style }) {
+  const base = {
+    border: `1px solid ${C.line}`, background: "transparent", color: C.bone,
+    padding: "10px 18px", fontSize: 14, borderRadius: 2, opacity: disabled ? 0.4 : 1,
+  };
+  const kinds = {
+    ghost: {},
+    primary: { background: C.garnet, border: `1px solid ${C.garnet}`, color: C.bone },
+    quiet: { border: "1px solid transparent", color: C.muted, padding: "8px 10px" },
+  };
+  return (
+    <button onClick={onClick} disabled={disabled} style={{ ...base, ...kinds[kind], ...style }}>
+      {children}
+    </button>
+  );
+}
+
+const EST_CHOICES = [15, 30, 45, 60, 90, 120];
+
+function PlanWizard({ day, setDay, onCommitted, yesterdayLeftovers, pullLeftovers }) {
+  const [step, setStep] = useState(0);
+  const [title, setTitle] = useState("");
+  const [est, setEst] = useState(30);
+  const inputRef = useRef(null);
+
+  const steps = [
+    { name: "Anneal", plain: "Empty your head. List everything pulling at you today." },
+    { name: "Set the stone", plain: "Choose the one piece that matters most." },
+    { name: "Solder", plain: "Give each task a time. Commit to a day that actually fits." },
+  ];
+
+  const addTask = () => {
+    const t = title.trim();
+    if (!t) return;
+    setDay((d) => ({ ...d, tasks: [...d.tasks, { id: uid(), title: t, est, start: null, done: false, focusedSec: 0 }] }));
+    setTitle("");
+    inputRef.current && inputRef.current.focus();
+  };
+  const removeTask = (id) => setDay((d) => ({
+    ...d, tasks: d.tasks.filter((t) => t.id !== id), focusId: d.focusId === id ? null : d.focusId,
+  }));
+  const patchTask = (id, patch) => setDay((d) => ({
+    ...d, tasks: d.tasks.map((t) => (t.id === id ? { ...t, ...patch } : t)),
+  }));
+
+  const totalMin = day.tasks.reduce((s, t) => s + t.est, 0);
+  const over = totalMin > 8 * 60;
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 18, marginBottom: 28 }}>
+        {steps.map((s, i) => (
+          <div key={s.name} style={{ opacity: i === step ? 1 : 0.35 }}>
+            <div style={{ ...mono, fontSize: 11, color: i === step ? C.garnet : C.faint, letterSpacing: "0.15em" }}>
+              {["I", "II", "III"][i]}
+            </div>
+            <div style={{ ...display, fontSize: 20, fontStyle: "italic", color: C.bone }}>{s.name}</div>
+          </div>
+        ))}
+      </div>
+      <p style={{ color: C.muted, fontSize: 15, margin: "0 0 20px", maxWidth: 480 }}>{steps[step].plain}</p>
+
+      {step === 0 && (
+        <div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+            <input
+              ref={inputRef}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addTask()}
+              placeholder="What's on the bench?"
+              style={{
+                flex: "1 1 220px", background: C.panel, border: `1px solid ${C.line}`, color: C.bone,
+                padding: "12px 14px", fontSize: 15, borderRadius: 2,
+              }}
+            />
+            <select
+              value={est}
+              onChange={(e) => setEst(Number(e.target.value))}
+              aria-label="Time estimate"
+              style={{ ...mono, background: C.panel, border: `1px solid ${C.line}`, color: C.bone, padding: "12px 10px", fontSize: 13, borderRadius: 2 }}
+            >
+              {EST_CHOICES.map((m) => <option key={m} value={m}>{fmtDur(m)}</option>)}
+            </select>
+            <Btn onClick={addTask}>Add</Btn>
+          </div>
+
+          {yesterdayLeftovers > 0 && (
+            <button
+              onClick={pullLeftovers}
+              style={{ background: "none", border: "none", color: C.gold, fontSize: 13, padding: 0, marginBottom: 16, textDecoration: "underline", textUnderlineOffset: 3 }}
+            >
+              Pull {yesterdayLeftovers} unfinished {yesterdayLeftovers === 1 ? "task" : "tasks"} from yesterday
+            </button>
+          )}
+
+          <TaskList tasks={day.tasks} onRemove={removeTask} />
+          <div style={{ marginTop: 24 }}>
+            <Btn kind="primary" disabled={day.tasks.length === 0} onClick={() => setStep(1)}>Next — choose your focus</Btn>
+          </div>
+        </div>
+      )}
+
+      {step === 1 && (
+        <div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {day.tasks.map((t) => {
+              const chosen = day.focusId === t.id;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => setDay((d) => ({ ...d, focusId: t.id }))}
+                  style={{
+                    textAlign: "left", display: "flex", justifyContent: "space-between", alignItems: "center",
+                    background: chosen ? C.garnetDim : C.panel, border: `1px solid ${chosen ? C.garnet : C.line}`,
+                    color: C.bone, padding: "14px 16px", fontSize: 15, borderRadius: 2,
+                  }}
+                >
+                  <span>{t.title}</span>
+                  <span style={{ ...mono, fontSize: 12, color: chosen ? C.bone : C.muted }}>{fmtDur(t.est)}</span>
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 24 }}>
+            <Btn kind="quiet" onClick={() => setStep(0)}>Back</Btn>
+            <Btn kind="primary" disabled={!day.focusId} onClick={() => setStep(2)}>Next — box your time</Btn>
+          </div>
+        </div>
+      )}
+
+      {step === 2 && (
+        <div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {day.tasks.map((t) => (
+              <div
+                key={t.id}
+                style={{
+                  display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap",
+                  background: C.panel, border: `1px solid ${day.focusId === t.id ? C.garnet : C.line}`,
+                  padding: "10px 14px", borderRadius: 2,
+                }}
+              >
+                <span style={{ flex: "1 1 160px", fontSize: 15, color: C.bone }}>{t.title}</span>
+                <input
+                  type="time"
+                  value={t.start ?? ""}
+                  onChange={(e) => patchTask(t.id, { start: e.target.value || null })}
+                  aria-label={`Start time for ${t.title}`}
+                  style={{ ...mono, background: C.panel2, border: `1px solid ${C.line}`, color: C.bone, padding: "8px 10px", fontSize: 13, borderRadius: 2 }}
+                />
+                <select
+                  value={t.est}
+                  onChange={(e) => patchTask(t.id, { est: Number(e.target.value) })}
+                  aria-label={`Estimate for ${t.title}`}
+                  style={{ ...mono, background: C.panel2, border: `1px solid ${C.line}`, color: C.bone, padding: "8px 8px", fontSize: 13, borderRadius: 2 }}
+                >
+                  {EST_CHOICES.map((m) => <option key={m} value={m}>{fmtDur(m)}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 18, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
+            <div style={{ ...mono, fontSize: 13, color: over ? C.garnet : C.muted }}>
+              {fmtDur(totalMin)} planned{over ? " — over 8 hours. Cut or carry something; a plan you can't finish isn't a plan." : " of an 8h day"}
+            </div>
+            <div style={{ height: 4, background: C.panel2, marginTop: 8, borderRadius: 2, overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${Math.min(100, (totalMin / 480) * 100)}%`, background: over ? C.garnet : C.gold }} />
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 10, marginTop: 24 }}>
+            <Btn kind="quiet" onClick={() => setStep(1)}>Back</Btn>
+            <Btn kind="primary" onClick={() => { setDay((d) => ({ ...d, committed: true })); onCommitted(); }}>
+              Commit the day
+            </Btn>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TaskList({ tasks, onRemove }) {
+  if (tasks.length === 0)
+    return <div style={{ color: C.faint, fontSize: 14, fontStyle: "italic" }}>Nothing yet. Add the first thing that comes to mind.</div>;
+  return (
+    <div style={{ display: "grid", gap: 6 }}>
+      {tasks.map((t) => (
+        <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10, background: C.panel, border: `1px solid ${C.line}`, padding: "10px 14px", borderRadius: 2 }}>
+          <span style={{ flex: 1, fontSize: 15, color: C.bone }}>{t.title}</span>
+          <span style={{ ...mono, fontSize: 12, color: C.muted }}>{fmtDur(t.est)}</span>
+          <button onClick={() => onRemove(t.id)} aria-label={`Remove ${t.title}`} style={{ background: "none", border: "none", color: C.faint, fontSize: 16, lineHeight: 1 }}>×</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DayView({ day, setDay, onShutdown, onAdjust }) {
+  const [timer, setTimer] = useState(null);
+  const tickRef = useRef(null);
+
+  useEffect(() => {
+    if (!timer || !timer.running) return;
+    const isWork = timer.mode !== "pomo" || timer.phase === "work";
+    tickRef.current = setInterval(() => {
+      setTimer((t) => {
+        if (!t) return t;
+        let next = { ...t, remaining: t.remaining - 1 };
+        if (t.mode === "pomo" && next.remaining <= 0) {
+          beep(t.phase === "work" ? 2 : 1);
+          if (t.phase === "work") {
+            const pomos = (t.pomos || 0) + 1;
+            next = { ...next, phase: "break", pomos, remaining: pomos % 4 === 0 ? POMO_LONG : POMO_BREAK };
+          } else {
+            next = { ...next, phase: "work", remaining: POMO_WORK };
+          }
+        }
+        return next;
+      });
+      if (isWork) {
+        setDay((d) => ({
+          ...d,
+          tasks: d.tasks.map((x) => (x.id === timer.taskId ? { ...x, focusedSec: (x.focusedSec || 0) + 1 } : x)),
+        }));
+      }
+    }, 1000);
+    return () => clearInterval(tickRef.current);
+  }, [timer && timer.running, timer && timer.taskId, timer && timer.mode, timer && timer.phase]);
+
+  const startTimer = (t, mode = "est") => setTimer(
+    mode === "pomo"
+      ? { taskId: t.id, mode: "pomo", phase: "work", remaining: POMO_WORK, running: true, pomos: 0 }
+      : { taskId: t.id, mode: "est", remaining: t.est * 60, running: true }
+  );
+  const switchMode = (mode) => {
+    const t = day.tasks.find((x) => x.id === timer.taskId);
+    if (t) startTimer(t, mode);
+  };
+  const activeTask = timer ? day.tasks.find((t) => t.id === timer.taskId) : null;
+
+  const markDone = (id) => {
+    setDay((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? { ...t, done: !t.done } : t)) }));
+    if (timer && timer.taskId === id) setTimer(null);
+  };
+
+  const scheduled = day.tasks.filter((t) => t.start != null).sort((a, b) => toMin(a.start) - toMin(b.start));
+  const unscheduled = day.tasks.filter((t) => t.start == null);
+  const focus = day.tasks.find((t) => t.id === day.focusId);
+
+  const t0 = Math.min(8 * 60, ...scheduled.map((t) => toMin(t.start))) - 30;
+  const t1 = Math.max(18 * 60, ...scheduled.map((t) => toMin(t.start) + t.est)) + 30;
+  const ppm = 1.05;
+  const firstHour = Math.ceil(t0 / 60), lastHour = Math.floor(t1 / 60);
+  const hours = []; for (let h = firstHour; h <= lastHour; h++) hours.push(h);
+
+  const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+
+  return (
+    <div>
+      {focus && (
+        <div style={{ borderLeft: `3px solid ${C.garnet}`, background: C.panel, padding: "12px 16px", marginBottom: 22 }}>
+          <Eyebrow>Today's stone</Eyebrow>
+          <div style={{ ...display, fontSize: 22, color: C.bone, textDecoration: focus.done ? "line-through" : "none", opacity: focus.done ? 0.5 : 1 }}>
+            {focus.title}
+          </div>
+        </div>
+      )}
+
+      {activeTask && (
+        <div style={{ background: C.panel2, border: `1px solid ${timer.mode === "pomo" && timer.phase === "break" ? C.patina : C.gold}`, padding: 18, marginBottom: 22, textAlign: "center" }}>
+          <div style={{ fontSize: 14, color: C.muted, marginBottom: 8 }}>{activeTask.title}</div>
+          <div style={{ display: "inline-flex", border: `1px solid ${C.line}`, borderRadius: 2, marginBottom: 10 }}>
+            {[["est", "Estimate"], ["pomo", "Pomodoro"]].map(([m, label]) => (
+              <button
+                key={m}
+                onClick={() => timer.mode !== m && switchMode(m)}
+                style={{ ...mono, fontSize: 11, letterSpacing: "0.08em", padding: "5px 12px", border: "none", background: timer.mode === m ? C.panel : "transparent", color: timer.mode === m ? C.gold : C.faint }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {timer.mode === "pomo" && (
+            <div style={{ ...mono, fontSize: 11, color: timer.phase === "break" ? C.patina : C.gold, letterSpacing: "0.15em", textTransform: "uppercase" }}>
+              {timer.phase === "break" ? (timer.pomos % 4 === 0 ? "long break" : "break") : `strike ${(timer.pomos || 0) + 1}`}
+            </div>
+          )}
+          <div style={{ ...mono, fontSize: 44, color: timer.mode === "pomo" ? (timer.phase === "break" ? C.patina : C.gold) : timer.remaining < 0 ? C.garnet : C.gold, animation: timer.running ? "none" : "benchPulse 1.6s infinite" }}>
+            {timer.mode === "est" && timer.remaining < 0 ? "+" : ""}{fmtClock(timer.remaining)}
+          </div>
+          <div style={{ ...mono, fontSize: 11, color: C.faint, marginBottom: 6 }}>
+            {timer.mode === "pomo" ? (timer.phase === "work" ? "until break" : "until next strike") : timer.remaining < 0 ? "past estimate" : "remaining"}
+          </div>
+          {timer.mode === "pomo" && (timer.pomos || 0) > 0 && (
+            <div style={{ ...mono, fontSize: 14, color: C.gold, letterSpacing: "0.3em", marginBottom: 8 }} aria-label={`${timer.pomos} rounds finished`}>
+              {"▮".repeat(timer.pomos)}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+            <Btn onClick={() => setTimer((t) => ({ ...t, running: !t.running }))}>{timer.running ? "Pause" : "Resume"}</Btn>
+            <Btn kind="primary" onClick={() => markDone(activeTask.id)}>Done</Btn>
+            <Btn kind="quiet" onClick={() => setTimer(null)}>Stop</Btn>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 300px", position: "relative", height: (t1 - t0) * ppm, borderLeft: `1px solid ${C.line}` }}>
+          {hours.map((h) => (
+            <div key={h} style={{ position: "absolute", top: (h * 60 - t0) * ppm, left: 0, right: 0 }}>
+              <div style={{ borderTop: `1px solid ${C.line}`, opacity: 0.6 }} />
+              <span style={{ ...mono, fontSize: 10, color: C.faint, position: "absolute", top: 2, left: 6 }}>{fmt12(h * 60)}</span>
+            </div>
+          ))}
+          {nowMin > t0 && nowMin < t1 && (
+            <div style={{ position: "absolute", top: (nowMin - t0) * ppm, left: 0, right: 0, borderTop: `1px dashed ${C.gold}`, opacity: 0.7 }} />
+          )}
+          {scheduled.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => (t.done ? markDone(t.id) : startTimer(t))}
+              title={t.done ? "Mark not done" : "Start focus"}
+              style={{
+                position: "absolute", top: (toMin(t.start) - t0) * ppm, left: 52, right: 4,
+                height: Math.max(30, t.est * ppm - 2), textAlign: "left",
+                background: t.done ? "transparent" : t.id === day.focusId ? C.garnetDim : C.panel2,
+                border: `1px solid ${t.done ? C.patina : t.id === day.focusId ? C.garnet : C.line}`,
+                borderLeft: `3px solid ${t.done ? C.patina : t.id === day.focusId ? C.garnet : C.gold}`,
+                color: C.bone, padding: "6px 10px", borderRadius: 2, overflow: "hidden",
+              }}
+            >
+              <span style={{ fontSize: 13, textDecoration: t.done ? "line-through" : "none", opacity: t.done ? 0.5 : 1 }}>{t.title}</span>
+              <span style={{ ...mono, fontSize: 10, color: C.muted, display: "block" }}>{fmt12(toMin(t.start))} · {fmtDur(t.est)}</span>
+            </button>
+          ))}
+        </div>
+
+        <div style={{ flex: "1 1 240px", minWidth: 220 }}>
+          {unscheduled.length > 0 && (
+            <div style={{ marginBottom: 18 }}>
+              <Eyebrow>Loose stock</Eyebrow>
+              <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
+                {unscheduled.map((t) => (
+                  <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, background: C.panel, border: `1px solid ${C.line}`, padding: "8px 12px", borderRadius: 2 }}>
+                    <button
+                      onClick={() => markDone(t.id)}
+                      aria-label={t.done ? `Mark ${t.title} not done` : `Mark ${t.title} done`}
+                      style={{ width: 16, height: 16, borderRadius: 2, border: `1px solid ${t.done ? C.patina : C.faint}`, background: t.done ? C.patina : "transparent" }}
+                    />
+                    <span style={{ flex: 1, fontSize: 14, color: C.bone, textDecoration: t.done ? "line-through" : "none", opacity: t.done ? 0.5 : 1 }}>{t.title}</span>
+                    {!t.done && <button onClick={() => startTimer(t)} style={{ background: "none", border: `1px solid ${C.line}`, color: C.gold, fontSize: 11, padding: "3px 8px", borderRadius: 2 }}>focus</button>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div style={{ display: "grid", gap: 8 }}>
+            <Btn kind="quiet" onClick={onAdjust} style={{ textAlign: "left" }}>Adjust the plan</Btn>
+            <Btn onClick={onShutdown} style={{ textAlign: "left" }}>Quench — end the day</Btn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Shutdown({ day, setDay, onFinish, onBack }) {
+  const unfinished = day.tasks.filter((t) => !t.done);
+  const [carry, setCarry] = useState(() => new Set(unfinished.map((t) => t.id)));
+  const doneCount = day.tasks.filter((t) => t.done).length;
+  const focusedMin = Math.round(day.tasks.reduce((s, t) => s + (t.focusedSec || 0), 0) / 60);
+
+  const toggleCarry = (id) => setCarry((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  return (
+    <div style={{ maxWidth: 560 }}>
+      <Eyebrow>Quench</Eyebrow>
+      <h2 style={{ ...display, fontSize: 30, fontWeight: 500, color: C.bone, margin: "6px 0 4px" }}>End the day</h2>
+      <p style={{ ...mono, fontSize: 12, color: C.muted, marginBottom: 22 }}>
+        {doneCount} of {day.tasks.length} finished · {fmtDur(Math.max(1, focusedMin))} in focus
+      </p>
+
+      <div style={{ display: "grid", gap: 6, marginBottom: 22 }}>
+        {day.tasks.map((t) => (
+          <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10, background: C.panel, border: `1px solid ${C.line}`, padding: "10px 14px", borderRadius: 2 }}>
+            <button
+              onClick={() => setDay((d) => ({ ...d, tasks: d.tasks.map((x) => (x.id === t.id ? { ...x, done: !x.done } : x)) }))}
+              aria-label={`Toggle ${t.title}`}
+              style={{ width: 16, height: 16, borderRadius: 2, border: `1px solid ${t.done ? C.patina : C.faint}`, background: t.done ? C.patina : "transparent", flexShrink: 0 }}
+            />
+            <span style={{ flex: 1, fontSize: 14, color: C.bone, textDecoration: t.done ? "line-through" : "none", opacity: t.done ? 0.55 : 1 }}>{t.title}</span>
+            {!t.done && (
+              <label style={{ ...mono, fontSize: 11, color: carry.has(t.id) ? C.gold : C.faint, display: "flex", gap: 6, alignItems: "center" }}>
+                <input type="checkbox" checked={carry.has(t.id)} onChange={() => toggleCarry(t.id)} /> tomorrow
+              </label>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <textarea
+        value={day.reflection}
+        onChange={(e) => setDay((d) => ({ ...d, reflection: e.target.value }))}
+        placeholder="One honest note about how today went."
+        rows={3}
+        style={{ width: "100%", background: C.panel, border: `1px solid ${C.line}`, color: C.bone, padding: 12, fontSize: 14, borderRadius: 2, resize: "vertical" }}
+      />
+
+      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+        <Btn kind="quiet" onClick={onBack}>Back</Btn>
+        <Btn kind="primary" onClick={() => onFinish([...carry])}>Quench the day</Btn>
+      </div>
+    </div>
+  );
+}
+
+function Bench() {
+  const [view, setView] = useState("loading");
+  const [day, setDay] = useState(null);
+  const [yLeftovers, setYLeftovers] = useState([]);
+  const todayKey = keyFor(new Date());
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      const stored = await loadDay(todayKey);
+      const d = stored || blankDay(todayKey);
+      setDay(d);
+      const y = await loadDay(keyFor(addDays(new Date(), -1)));
+      if (y) setYLeftovers(y.tasks.filter((t) => !t.done));
+      setView(d.shutdownDone ? "closed" : d.committed ? "day" : "plan");
+    })();
+  }, [todayKey]);
+
+  useEffect(() => {
+    if (!day) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => saveDay(todayKey, day), 900);
+    return () => clearTimeout(saveTimer.current);
+  }, [day, todayKey]);
+
+  // flush a save immediately when the tab is closed, hidden, or switched away from
+  useEffect(() => {
+    const flush = () => { if (day) { clearTimeout(saveTimer.current); saveDay(todayKey, day); } };
+    const onVis = () => { if (document.visibilityState === "hidden") flush(); };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [day, todayKey]);
+
+  const pullLeftovers = () => {
+    setDay((d) => ({
+      ...d,
+      tasks: [...d.tasks, ...yLeftovers.map((t) => ({ ...t, id: uid(), done: false, start: null, focusedSec: 0 }))],
+    }));
+    setYLeftovers([]);
+  };
+
+  const finishDay = async (carryIds) => {
+    const closed = { ...day, shutdownDone: true };
+    setDay(closed);
+    await saveDay(todayKey, closed);
+    const carried = day.tasks.filter((t) => carryIds.includes(t.id));
+    if (carried.length) {
+      const tk = keyFor(addDays(new Date(), 1));
+      const tomorrow = (await loadDay(tk)) || blankDay(tk);
+      tomorrow.tasks = [...tomorrow.tasks, ...carried.map((t) => ({ ...t, id: uid(), done: false, start: null, focusedSec: 0 }))];
+      await saveDay(tk, tomorrow);
+    }
+    setView("closed");
+  };
+
+  const dateLabel = new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+
+  return (
+    <div className="bench" style={{ minHeight: "100vh", background: C.bg, color: C.bone, padding: "28px 18px 60px", fontFamily: "system-ui, -apple-system, sans-serif" }}>
+      <div style={{ maxWidth: 760, margin: "0 auto" }}>
+        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderBottom: `1px solid ${C.line}`, paddingBottom: 14, marginBottom: 28 }}>
+          <div style={{ ...display, fontSize: 26, fontStyle: "italic", color: C.bone }}>Bench</div>
+          <div style={{ ...mono, fontSize: 11, color: C.muted, letterSpacing: "0.08em" }}>{dateLabel}</div>
+        </header>
+
+        {view === "loading" && <div style={{ color: C.faint, fontStyle: "italic" }}>Opening the shop…</div>}
+
+        {view === "plan" && day && (
+          <PlanWizard
+            day={day} setDay={setDay}
+            onCommitted={() => setView("day")}
+            yesterdayLeftovers={yLeftovers.length}
+            pullLeftovers={pullLeftovers}
+          />
+        )}
+
+        {view === "day" && day && (
+          <DayView day={day} setDay={setDay} onShutdown={() => setView("shutdown")} onAdjust={() => { setDay((d) => ({ ...d, committed: false })); setView("plan"); }} />
+        )}
+
+        {view === "shutdown" && day && (
+          <Shutdown day={day} setDay={setDay} onFinish={finishDay} onBack={() => setView("day")} />
+        )}
+
+        {view === "closed" && day && (
+          <div style={{ textAlign: "center", padding: "60px 0" }}>
+            <Eyebrow>Quenched</Eyebrow>
+            <div style={{ ...display, fontSize: 34, fontStyle: "italic", margin: "10px 0 6px" }}>The bench is clear.</div>
+            <p style={{ color: C.muted, fontSize: 14, maxWidth: 380, margin: "0 auto 24px" }}>
+              {day.tasks.filter((t) => t.done).length} of {day.tasks.length} finished. Anything carried over is waiting in tomorrow's plan.
+            </p>
+            <Btn kind="quiet" onClick={() => { setDay((d) => ({ ...d, shutdownDone: false })); setView("day"); }}>Reopen today</Btn>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Bench />);
+</script>
+</body>
+</html>
