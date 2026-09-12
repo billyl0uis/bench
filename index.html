@@ -33,8 +33,7 @@ const { useState, useEffect, useRef } = React;
 /* actually protects your data (see supabase/schema.sql).                 */
 /* ---------------------------------------------------------------------- */
 const SUPABASE_URL = "https://erlwmcmvsgwxttadvaty.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVybHdtY212c2d3eHR0YWR2YXR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNDU4NDQsImV4cCI6MjEwNDcyMTg0NH0.wlyTfJyfZNFExCjSer8EJpeoui7zF6CAJOsrO0YApKA
-";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVybHdtY212c2d3eHR0YWR2YXR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNDU4NDQsImV4cCI6MjEwNDcyMTg0NH0.wlyTfJyfZNFExCjSer8EJpeoui7zF6CAJOsrO0YApKA";
 const CHAT_FUNCTION_URL = "https://erlwmcmvsgwxttadvaty.supabase.co/functions/v1/chat";
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
