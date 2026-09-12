@@ -7,6 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=IBM+Plex+Mono:wght@400;500&display=swap');
 html, body { margin: 0; padding: 0; background: #121014; }
@@ -26,38 +27,17 @@ html, body { margin: 0; padding: 0; background: #121014; }
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef } = React;
 
-/* storage: Claude persistent storage if available, else the browser's own storage, else memory */
-if (!window.storage) {
-  let backend = null;
-  try {
-    localStorage.setItem("__bench_test", "1");
-    localStorage.removeItem("__bench_test");
-    backend = localStorage;
-  } catch (e) { backend = null; }
-  if (backend) {
-    window.storage = {
-      async get(k) { const v = backend.getItem("bench:" + k); if (v == null) throw new Error("not found"); return { key: k, value: v }; },
-      async set(k, v) { backend.setItem("bench:" + k, v); return { key: k, value: v }; },
-      async delete(k) { backend.removeItem("bench:" + k); return { key: k, deleted: true }; },
-      async list(p = "") {
-        const keys = [];
-        for (let i = 0; i < backend.length; i++) {
-          const k = backend.key(i);
-          if (k && k.startsWith("bench:" + p)) keys.push(k.slice(6));
-        }
-        return { keys };
-      },
-    };
-  } else {
-    const mem = {};
-    window.storage = {
-      async get(k) { if (!(k in mem)) throw new Error("not found"); return { key: k, value: mem[k] }; },
-      async set(k, v) { mem[k] = v; return { key: k, value: v }; },
-      async delete(k) { delete mem[k]; return { key: k, deleted: true }; },
-      async list(p = "") { return { keys: Object.keys(mem).filter((k) => k.startsWith(p)) }; },
-    };
-  }
-}
+/* ---------------------------------------------------------------------- */
+/* CONFIG — fill these in after you create your Supabase project.         */
+/* Safe to leave the anon key and URL public: Row Level Security is what  */
+/* actually protects your data (see supabase/schema.sql).                 */
+/* ---------------------------------------------------------------------- */
+const SUPABASE_URL = "https://erlwmcmvsgwxttadvaty.supabase.co";
+const SUPABASE_ANON_KEY = "YeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVybHdtY212c2d3eHR0YWR2YXR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNDU4NDQsImV4cCI6MjEwNDcyMTg0NH0.wlyTfJyfZNFExCjSer8EJpeoui7zF6CAJOsrO0YApKA
+";
+const CHAT_FUNCTION_URL = "https://erlwmcmvsgwxttadvaty.supabase.co/functions/v1/chat";
+
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const C = {
   bg: "#121014", panel: "#1B181F", panel2: "#232028", line: "#2E2933",
@@ -80,13 +60,13 @@ const fmtDur = (min) => {
   const h = Math.floor(min / 60), m = min % 60;
   return h ? (m ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
 };
-const uid = () => Math.random().toString(36).slice(2, 9);
-
+const uid = () => (window.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
 const POMO_WORK = 25 * 60, POMO_BREAK = 5 * 60, POMO_LONG = 15 * 60;
 const fmtClock = (sec) => {
   const s = Math.abs(sec);
   return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
 };
+
 function beep(times = 2) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -100,17 +80,70 @@ function beep(times = 2) {
   } catch (e) { /* audio unavailable — stay silent */ }
 }
 
-async function loadDay(key) {
-  try { const r = await window.storage.get(`day:${key}`); return r ? JSON.parse(r.value) : null; }
-  catch { return null; }
-}
-async function saveDay(key, data) {
-  try { await window.storage.set(`day:${key}`, JSON.stringify(data)); } catch (e) { console.error("save failed", e); }
-}
+/* ---------------------------------------------------------------------- */
+/* Data layer — Supabase instead of localStorage. Keeps the same shape    */
+/* the UI components already expect: {date, committed, shutdownDone,      */
+/* focusId, reflection, tasks:[{id,title,est,start,done,focusedSec}]}     */
+/* ---------------------------------------------------------------------- */
 const blankDay = (key) => ({
-  date: key, committed: false, shutdownDone: false, focusId: null, reflection: "", tasks: [],
+  date: key, committed: false, shutdownDone: false, focusId: null, reflection: "", tasks: [], dayId: null,
 });
 
+async function loadDay(userId, key) {
+  const { data: dayRow } = await sb.from("days").select("*").eq("user_id", userId).eq("date", key).maybeSingle();
+  if (!dayRow) return null;
+  const { data: taskRows } = await sb.from("tasks").select("*").eq("day_id", dayRow.id).order("sort_order");
+  return {
+    date: key,
+    dayId: dayRow.id,
+    committed: dayRow.committed,
+    shutdownDone: dayRow.shutdown_done,
+    focusId: dayRow.focus_task_id,
+    reflection: dayRow.reflection || "",
+    tasks: (taskRows || []).map((t) => ({
+      id: t.id, title: t.title, est: t.est_minutes, start: t.start_time,
+      done: t.done, focusedSec: t.focused_seconds,
+    })),
+  };
+}
+
+async function saveDay(userId, key, day) {
+  try {
+    const { data: dayRow, error: dayErr } = await sb
+      .from("days")
+      .upsert(
+        { id: day.dayId || undefined, user_id: userId, date: key, committed: day.committed,
+          shutdown_done: day.shutdownDone, focus_task_id: day.focusId || null, reflection: day.reflection },
+        { onConflict: "user_id,date" }
+      )
+      .select()
+      .single();
+    if (dayErr) throw dayErr;
+
+    const dayId = dayRow.id;
+    const { data: existing } = await sb.from("tasks").select("id").eq("day_id", dayId);
+    const existingIds = new Set((existing || []).map((t) => t.id));
+    const currentIds = new Set(day.tasks.map((t) => t.id));
+
+    const toDelete = [...existingIds].filter((id) => !currentIds.has(id));
+    if (toDelete.length) await sb.from("tasks").delete().in("id", toDelete);
+
+    const rows = day.tasks.map((t, i) => ({
+      id: t.id, day_id: dayId, user_id: userId, title: t.title, est_minutes: t.est,
+      start_time: t.start, done: t.done, focused_seconds: t.focusedSec || 0, sort_order: i,
+    }));
+    if (rows.length) await sb.from("tasks").upsert(rows);
+
+    return dayId;
+  } catch (e) {
+    console.error("save failed", e);
+    return day.dayId;
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Shared bits                                                            */
+/* ---------------------------------------------------------------------- */
 function Eyebrow({ children }) {
   return (
     <div style={{ ...mono, fontSize: 11, letterSpacing: "0.22em", textTransform: "uppercase", color: C.gold }}>
@@ -205,7 +238,6 @@ function PlanWizard({ day, setDay, onCommitted, yesterdayLeftovers, pullLeftover
             </select>
             <Btn onClick={addTask}>Add</Btn>
           </div>
-
           {yesterdayLeftovers > 0 && (
             <button
               onClick={pullLeftovers}
@@ -214,7 +246,6 @@ function PlanWizard({ day, setDay, onCommitted, yesterdayLeftovers, pullLeftover
               Pull {yesterdayLeftovers} unfinished {yesterdayLeftovers === 1 ? "task" : "tasks"} from yesterday
             </button>
           )}
-
           <TaskList tasks={day.tasks} onRemove={removeTask} />
           <div style={{ marginTop: 24 }}>
             <Btn kind="primary" disabled={day.tasks.length === 0} onClick={() => setStep(1)}>Next — choose your focus</Btn>
@@ -281,7 +312,6 @@ function PlanWizard({ day, setDay, onCommitted, yesterdayLeftovers, pullLeftover
               </div>
             ))}
           </div>
-
           <div style={{ marginTop: 18, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
             <div style={{ ...mono, fontSize: 13, color: over ? C.garnet : C.muted }}>
               {fmtDur(totalMin)} planned{over ? " — over 8 hours. Cut or carry something; a plan you can't finish isn't a plan." : " of an 8h day"}
@@ -290,7 +320,6 @@ function PlanWizard({ day, setDay, onCommitted, yesterdayLeftovers, pullLeftover
               <div style={{ height: "100%", width: `${Math.min(100, (totalMin / 480) * 100)}%`, background: over ? C.garnet : C.gold }} />
             </div>
           </div>
-
           <div style={{ display: "flex", gap: 10, marginTop: 24 }}>
             <Btn kind="quiet" onClick={() => setStep(1)}>Back</Btn>
             <Btn kind="primary" onClick={() => { setDay((d) => ({ ...d, committed: true })); onCommitted(); }}>
@@ -376,7 +405,6 @@ function DayView({ day, setDay, onShutdown, onAdjust }) {
   const ppm = 1.05;
   const firstHour = Math.ceil(t0 / 60), lastHour = Math.floor(t1 / 60);
   const hours = []; for (let h = firstHour; h <= lastHour; h++) hours.push(h);
-
   const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
 
   return (
@@ -458,7 +486,6 @@ function DayView({ day, setDay, onShutdown, onAdjust }) {
             </button>
           ))}
         </div>
-
         <div style={{ flex: "1 1 240px", minWidth: 220 }}>
           {unscheduled.length > 0 && (
             <div style={{ marginBottom: 18 }}>
@@ -493,7 +520,6 @@ function Shutdown({ day, setDay, onFinish, onBack }) {
   const [carry, setCarry] = useState(() => new Set(unfinished.map((t) => t.id)));
   const doneCount = day.tasks.filter((t) => t.done).length;
   const focusedMin = Math.round(day.tasks.reduce((s, t) => s + (t.focusedSec || 0), 0) / 60);
-
   const toggleCarry = (id) => setCarry((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   return (
@@ -503,7 +529,6 @@ function Shutdown({ day, setDay, onFinish, onBack }) {
       <p style={{ ...mono, fontSize: 12, color: C.muted, marginBottom: 22 }}>
         {doneCount} of {day.tasks.length} finished · {fmtDur(Math.max(1, focusedMin))} in focus
       </p>
-
       <div style={{ display: "grid", gap: 6, marginBottom: 22 }}>
         {day.tasks.map((t) => (
           <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10, background: C.panel, border: `1px solid ${C.line}`, padding: "10px 14px", borderRadius: 2 }}>
@@ -521,7 +546,6 @@ function Shutdown({ day, setDay, onFinish, onBack }) {
           </div>
         ))}
       </div>
-
       <textarea
         value={day.reflection}
         onChange={(e) => setDay((d) => ({ ...d, reflection: e.target.value }))}
@@ -529,7 +553,6 @@ function Shutdown({ day, setDay, onFinish, onBack }) {
         rows={3}
         style={{ width: "100%", background: C.panel, border: `1px solid ${C.line}`, color: C.bone, padding: 12, fontSize: 14, borderRadius: 2, resize: "vertical" }}
       />
-
       <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
         <Btn kind="quiet" onClick={onBack}>Back</Btn>
         <Btn kind="primary" onClick={() => onFinish([...carry])}>Quench the day</Btn>
@@ -538,19 +561,207 @@ function Shutdown({ day, setDay, onFinish, onBack }) {
   );
 }
 
-function Bench() {
-  const [view, setView] = useState("loading");
-  const [day, setDay] = useState(null);
-  const [yLeftovers, setYLeftovers] = useState([]);
-  const todayKey = keyFor(new Date());
-  const saveTimer = useRef(null);
+/* ---------------------------------------------------------------------- */
+/* History — real past days, pulled from the database.                    */
+/* ---------------------------------------------------------------------- */
+function History({ userId }) {
+  const [days, setDays] = useState(null);
+  const [openId, setOpenId] = useState(null);
+  const [openTasks, setOpenTasks] = useState([]);
 
   useEffect(() => {
     (async () => {
-      const stored = await loadDay(todayKey);
-      const d = stored || blankDay(todayKey);
-      setDay(d);
-      const y = await loadDay(keyFor(addDays(new Date(), -1)));
+      const { data } = await sb.from("days").select("*").eq("user_id", userId).order("date", { ascending: false }).limit(60);
+      setDays(data || []);
+    })();
+  }, [userId]);
+
+  const openDay = async (dayRow) => {
+    if (openId === dayRow.id) { setOpenId(null); return; }
+    const { data } = await sb.from("tasks").select("*").eq("day_id", dayRow.id).order("sort_order");
+    setOpenTasks(data || []);
+    setOpenId(dayRow.id);
+  };
+
+  if (days === null) return <div style={{ color: C.faint, fontStyle: "italic" }}>Loading history…</div>;
+  if (days.length === 0) return <div style={{ color: C.faint, fontStyle: "italic" }}>No days recorded yet.</div>;
+
+  return (
+    <div style={{ display: "grid", gap: 8, maxWidth: 640 }}>
+      {days.map((d) => (
+        <div key={d.id} style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 2 }}>
+          <button
+            onClick={() => openDay(d)}
+            style={{ width: "100%", textAlign: "left", background: "none", border: "none", color: C.bone, padding: "12px 14px", display: "flex", justifyContent: "space-between" }}
+          >
+            <span style={{ fontSize: 15 }}>{d.date}</span>
+            <span style={{ ...mono, fontSize: 12, color: C.muted }}>
+              {d.shutdown_done ? "quenched" : d.committed ? "in progress" : "unplanned"}
+            </span>
+          </button>
+          {openId === d.id && (
+            <div style={{ padding: "0 14px 14px" }}>
+              {openTasks.length === 0 && <div style={{ color: C.faint, fontSize: 13, fontStyle: "italic" }}>No tasks logged.</div>}
+              <div style={{ display: "grid", gap: 4 }}>
+                {openTasks.map((t) => (
+                  <div key={t.id} style={{ fontSize: 13, color: t.done ? C.patina : C.muted, textDecoration: t.done ? "line-through" : "none" }}>
+                    {t.title} <span style={{ ...mono, fontSize: 11, color: C.faint }}>({fmtDur(t.est_minutes)})</span>
+                  </div>
+                ))}
+              </div>
+              {d.reflection && (
+                <div style={{ marginTop: 10, fontSize: 13, color: C.muted, fontStyle: "italic" }}>"{d.reflection}"</div>
+              )}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Chat — talks to the Supabase Edge Function, which talks to Claude.     */
+/* ---------------------------------------------------------------------- */
+function Chat({ userId, todayKey, onTasksAdded }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const bottomRef = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      const { data } = await sb.from("chat_messages").select("*").eq("user_id", userId).order("created_at").limit(50);
+      setMessages((data || []).map((m) => ({ role: m.role, content: m.content })));
+      setLoaded(true);
+    })();
+  }, [userId]);
+
+  useEffect(() => { bottomRef.current && bottomRef.current.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busy) return;
+    setInput("");
+    setBusy(true);
+    const nextMessages = [...messages, { role: "user", content: text }];
+    setMessages(nextMessages);
+
+    try {
+      const { data: sessionData } = await sb.auth.getSession();
+      const token = sessionData?.session?.access_token;
+      const resp = await fetch(CHAT_FUNCTION_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ message: text, history: messages, today: todayKey }),
+      });
+      const data = await resp.json();
+      if (data.error) {
+        setMessages((m) => [...m, { role: "assistant", content: `Error: ${data.error}` }]);
+      } else {
+        setMessages((m) => [...m, { role: "assistant", content: data.reply }]);
+        if (data.addedTasks && data.addedTasks.length) onTasksAdded();
+      }
+    } catch (e) {
+      setMessages((m) => [...m, { role: "assistant", content: `Couldn't reach the chat function: ${String(e)}` }]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: 420, maxWidth: 480, border: `1px solid ${C.line}`, background: C.panel }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "grid", gap: 10, alignContent: "start" }}>
+        {!loaded && <div style={{ color: C.faint, fontStyle: "italic", fontSize: 13 }}>Loading…</div>}
+        {messages.map((m, i) => (
+          <div key={i} style={{
+            justifySelf: m.role === "user" ? "end" : "start", maxWidth: "85%",
+            background: m.role === "user" ? C.garnetDim : C.panel2,
+            border: `1px solid ${m.role === "user" ? C.garnet : C.line}`,
+            color: C.bone, padding: "8px 12px", borderRadius: 2, fontSize: 14,
+          }}>
+            {m.content}
+          </div>
+        ))}
+        {busy && <div style={{ color: C.faint, fontStyle: "italic", fontSize: 13 }}>thinking…</div>}
+        <div ref={bottomRef} />
+      </div>
+      <div style={{ display: "flex", borderTop: `1px solid ${C.line}` }}>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          placeholder="Tell Bench what's on your plate…"
+          style={{ flex: 1, background: "none", border: "none", color: C.bone, padding: 12, fontSize: 14 }}
+        />
+        <Btn kind="quiet" onClick={send} disabled={busy}>Send</Btn>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Auth gate                                                              */
+/* ---------------------------------------------------------------------- */
+function Login() {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [err, setErr] = useState("");
+
+  const submit = async () => {
+    setErr("");
+    const { error } = await sb.auth.signInWithOtp({ email });
+    if (error) setErr(error.message); else setSent(true);
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: C.bg, color: C.bone, fontFamily: "system-ui, sans-serif" }}>
+      <div style={{ maxWidth: 340, textAlign: "center" }}>
+        <div style={{ ...display, fontSize: 30, fontStyle: "italic", marginBottom: 18 }}>Bench</div>
+        {sent ? (
+          <p style={{ color: C.muted, fontSize: 14 }}>Check your email for a sign-in link.</p>
+        ) : (
+          <React.Fragment>
+            <input
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+              placeholder="you@example.com"
+              style={{ width: "100%", background: C.panel, border: `1px solid ${C.line}`, color: C.bone, padding: 12, fontSize: 14, borderRadius: 2, marginBottom: 12 }}
+            />
+            <Btn kind="primary" onClick={submit} style={{ width: "100%" }}>Send sign-in link</Btn>
+            {err && <p style={{ color: C.garnet, fontSize: 13, marginTop: 10 }}>{err}</p>}
+          </React.Fragment>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Root                                                                   */
+/* ---------------------------------------------------------------------- */
+function Bench({ session }) {
+  const userId = session.user.id;
+  const [view, setView] = useState("loading");
+  const [tab, setTab] = useState("plan"); // plan | history
+  const [day, setDay] = useState(null);
+  const [yLeftovers, setYLeftovers] = useState([]);
+  const [showChat, setShowChat] = useState(false);
+  const todayKey = keyFor(new Date());
+  const saveTimer = useRef(null);
+
+  const refreshToday = async () => {
+    const d = (await loadDay(userId, todayKey)) || blankDay(todayKey);
+    setDay(d);
+    return d;
+  };
+
+  useEffect(() => {
+    (async () => {
+      const d = await refreshToday();
+      const y = await loadDay(userId, keyFor(addDays(new Date(), -1)));
       if (y) setYLeftovers(y.tasks.filter((t) => !t.done));
       setView(d.shutdownDone ? "closed" : d.committed ? "day" : "plan");
     })();
@@ -559,13 +770,15 @@ function Bench() {
   useEffect(() => {
     if (!day) return;
     clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => saveDay(todayKey, day), 900);
+    saveTimer.current = setTimeout(async () => {
+      const dayId = await saveDay(userId, todayKey, day);
+      if (dayId && !day.dayId) setDay((d) => (d ? { ...d, dayId } : d));
+    }, 900);
     return () => clearTimeout(saveTimer.current);
   }, [day, todayKey]);
 
-  // flush a save immediately when the tab is closed, hidden, or switched away from
   useEffect(() => {
-    const flush = () => { if (day) { clearTimeout(saveTimer.current); saveDay(todayKey, day); } };
+    const flush = () => { if (day) { clearTimeout(saveTimer.current); saveDay(userId, todayKey, day); } };
     const onVis = () => { if (document.visibilityState === "hidden") flush(); };
     window.addEventListener("pagehide", flush);
     window.addEventListener("beforeunload", flush);
@@ -588,13 +801,13 @@ function Bench() {
   const finishDay = async (carryIds) => {
     const closed = { ...day, shutdownDone: true };
     setDay(closed);
-    await saveDay(todayKey, closed);
+    await saveDay(userId, todayKey, closed);
     const carried = day.tasks.filter((t) => carryIds.includes(t.id));
     if (carried.length) {
       const tk = keyFor(addDays(new Date(), 1));
-      const tomorrow = (await loadDay(tk)) || blankDay(tk);
+      const tomorrow = (await loadDay(userId, tk)) || blankDay(tk);
       tomorrow.tasks = [...tomorrow.tasks, ...carried.map((t) => ({ ...t, id: uid(), done: false, start: null, focusedSec: 0 }))];
-      await saveDay(tk, tomorrow);
+      await saveDay(userId, tk, tomorrow);
     }
     setView("closed");
   };
@@ -603,47 +816,84 @@ function Bench() {
 
   return (
     <div className="bench" style={{ minHeight: "100vh", background: C.bg, color: C.bone, padding: "28px 18px 60px", fontFamily: "system-ui, -apple-system, sans-serif" }}>
-      <div style={{ maxWidth: 760, margin: "0 auto" }}>
-        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderBottom: `1px solid ${C.line}`, paddingBottom: 14, marginBottom: 28 }}>
-          <div style={{ ...display, fontSize: 26, fontStyle: "italic", color: C.bone }}>Bench</div>
-          <div style={{ ...mono, fontSize: 11, color: C.muted, letterSpacing: "0.08em" }}>{dateLabel}</div>
+      <div style={{ maxWidth: 900, margin: "0 auto" }}>
+        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderBottom: `1px solid ${C.line}`, paddingBottom: 14, marginBottom: 28, flexWrap: "wrap", gap: 10 }}>
+          <div style={{ display: "flex", gap: 20, alignItems: "baseline" }}>
+            <div style={{ ...display, fontSize: 26, fontStyle: "italic", color: C.bone }}>Bench</div>
+            <nav style={{ display: "flex", gap: 14 }}>
+              <button onClick={() => setTab("plan")} style={{ background: "none", border: "none", color: tab === "plan" ? C.gold : C.muted, fontSize: 13, ...mono }}>today</button>
+              <button onClick={() => setTab("history")} style={{ background: "none", border: "none", color: tab === "history" ? C.gold : C.muted, fontSize: 13, ...mono }}>history</button>
+            </nav>
+          </div>
+          <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+            <div style={{ ...mono, fontSize: 11, color: C.muted, letterSpacing: "0.08em" }}>{dateLabel}</div>
+            <Btn kind="quiet" onClick={() => setShowChat((s) => !s)}>{showChat ? "hide chat" : "chat"}</Btn>
+            <Btn kind="quiet" onClick={() => sb.auth.signOut()}>sign out</Btn>
+          </div>
         </header>
 
-        {view === "loading" && <div style={{ color: C.faint, fontStyle: "italic" }}>Opening the shop…</div>}
-
-        {view === "plan" && day && (
-          <PlanWizard
-            day={day} setDay={setDay}
-            onCommitted={() => setView("day")}
-            yesterdayLeftovers={yLeftovers.length}
-            pullLeftovers={pullLeftovers}
-          />
-        )}
-
-        {view === "day" && day && (
-          <DayView day={day} setDay={setDay} onShutdown={() => setView("shutdown")} onAdjust={() => { setDay((d) => ({ ...d, committed: false })); setView("plan"); }} />
-        )}
-
-        {view === "shutdown" && day && (
-          <Shutdown day={day} setDay={setDay} onFinish={finishDay} onBack={() => setView("day")} />
-        )}
-
-        {view === "closed" && day && (
-          <div style={{ textAlign: "center", padding: "60px 0" }}>
-            <Eyebrow>Quenched</Eyebrow>
-            <div style={{ ...display, fontSize: 34, fontStyle: "italic", margin: "10px 0 6px" }}>The bench is clear.</div>
-            <p style={{ color: C.muted, fontSize: 14, maxWidth: 380, margin: "0 auto 24px" }}>
-              {day.tasks.filter((t) => t.done).length} of {day.tasks.length} finished. Anything carried over is waiting in tomorrow's plan.
-            </p>
-            <Btn kind="quiet" onClick={() => { setDay((d) => ({ ...d, shutdownDone: false })); setView("day"); }}>Reopen today</Btn>
+        <div style={{ display: "flex", gap: 32, flexWrap: "wrap", alignItems: "flex-start" }}>
+          <div style={{ flex: "1 1 480px" }}>
+            {tab === "history" ? (
+              <History userId={userId} />
+            ) : (
+              <React.Fragment>
+                {view === "loading" && <div style={{ color: C.faint, fontStyle: "italic" }}>Opening the shop…</div>}
+                {view === "plan" && day && (
+                  <PlanWizard
+                    day={day} setDay={setDay}
+                    onCommitted={() => setView("day")}
+                    yesterdayLeftovers={yLeftovers.length}
+                    pullLeftovers={pullLeftovers}
+                  />
+                )}
+                {view === "day" && day && (
+                  <DayView day={day} setDay={setDay} onShutdown={() => setView("shutdown")} onAdjust={() => { setDay((d) => ({ ...d, committed: false })); setView("plan"); }} />
+                )}
+                {view === "shutdown" && day && (
+                  <Shutdown day={day} setDay={setDay} onFinish={finishDay} onBack={() => setView("day")} />
+                )}
+                {view === "closed" && day && (
+                  <div style={{ textAlign: "center", padding: "60px 0" }}>
+                    <Eyebrow>Quenched</Eyebrow>
+                    <div style={{ ...display, fontSize: 34, fontStyle: "italic", margin: "10px 0 6px" }}>The bench is clear.</div>
+                    <p style={{ color: C.muted, fontSize: 14, maxWidth: 380, margin: "0 auto 24px" }}>
+                      {day.tasks.filter((t) => t.done).length} of {day.tasks.length} finished. Anything carried over is waiting in tomorrow's plan.
+                    </p>
+                    <Btn kind="quiet" onClick={() => { setDay((d) => ({ ...d, shutdownDone: false })); setView("day"); }}>Reopen today</Btn>
+                  </div>
+                )}
+              </React.Fragment>
+            )}
           </div>
-        )}
+          {showChat && (
+            <div style={{ flex: "0 0 auto" }}>
+              <Chat userId={userId} todayKey={todayKey} onTasksAdded={refreshToday} />
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<Bench />);
+function Root() {
+  const [session, setSession] = useState(undefined); // undefined = checking, null = signed out
+
+  useEffect(() => {
+    sb.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = sb.auth.onAuthStateChange((_event, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  if (session === undefined) {
+    return <div style={{ minHeight: "100vh", background: C.bg, color: C.faint, display: "grid", placeItems: "center", fontStyle: "italic" }}>Loading…</div>;
+  }
+  if (!session) return <Login />;
+  return <Bench session={session} />;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Root />);
 </script>
 </body>
 </html>
