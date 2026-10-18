@@ -1,0 +1,32 @@
+# Free-tier Supabase projects pause after ~7 days with no activity, which
+# makes the project's hostname stop resolving ("Failed to fetch" on sign-in).
+# This hits the REST API on a schedule so the project never looks idle.
+#
+# The anon key below is the same public key already shipped in index.html.
+# With no logged-in user, RLS returns an empty list — but the query still
+# reaches Postgres, which is what counts as activity.
+
+name: Supabase keep-alive
+
+on:
+  schedule:
+    # Mon + Thu at 09:17 UTC — two pings a week leaves slack if GitHub
+    # skips a scheduled run, well inside Supabase's ~7-day idle window.
+    - cron: "17 9 * * 1,4"
+  workflow_dispatch: # lets you run it by hand from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query the database
+        env:
+          SUPABASE_URL: https://erlwmcmvsgwxttadvaty.supabase.co
+          SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVybHdtY212c2d3eHR0YWR2YXR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNDU4NDQsImV4cCI6MjEwNDcyMTg0NH0.wlyTfJyfZNFExCjSer8EJpeoui7zF6CAJOsrO0YApKA
+        # --fail makes the job go red (and GitHub emails you) if the project
+        # is paused or unreachable anyway.
+        run: |
+          curl --fail --silent --show-error --max-time 30 \
+            "$SUPABASE_URL/rest/v1/days?select=id&limit=1" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY"
