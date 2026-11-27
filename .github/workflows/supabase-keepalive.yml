@@ -3,8 +3,10 @@
 # This hits the REST API on a schedule so the project never looks idle.
 #
 # The anon key below is the same public key already shipped in index.html.
-# With no logged-in user, RLS returns an empty list — but the query still
-# reaches Postgres, which is what counts as activity.
+# It calls the keepalive() function (supabase/keepalive.sql), which writes a
+# timestamp to a one-row table. A read that RLS filtered down to [] didn't
+# reliably count as activity (the project paused anyway in Nov 2026); a
+# real write does.
 
 name: Supabase keep-alive
 
@@ -19,7 +21,7 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Query the database
+      - name: Write a heartbeat
         env:
           SUPABASE_URL: https://erlwmcmvsgwxttadvaty.supabase.co
           SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVybHdtY212c2d3eHR0YWR2YXR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNDU4NDQsImV4cCI6MjEwNDcyMTg0NH0.wlyTfJyfZNFExCjSer8EJpeoui7zF6CAJOsrO0YApKA
@@ -27,6 +29,9 @@ jobs:
         # is paused or unreachable anyway.
         run: |
           curl --fail --silent --show-error --max-time 30 \
-            "$SUPABASE_URL/rest/v1/days?select=id&limit=1" \
+            -X POST "$SUPABASE_URL/rest/v1/rpc/keepalive" \
             -H "apikey: $SUPABASE_ANON_KEY" \
-            -H "Authorization: Bearer $SUPABASE_ANON_KEY"
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{}'
+          echo
